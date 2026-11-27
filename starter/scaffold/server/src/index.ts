@@ -3,7 +3,12 @@ import { timingSafeEqual } from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { closeDb, connectDb, getDb } from './db.js';
 import { config } from './config.js';
-import { applyOutboundStatus, startOutboxWorker, stopOutboxWorker } from './outbox.js';
+import {
+  applyOutboundStatus,
+  persistOutboundMessage,
+  startOutboxWorker,
+  stopOutboxWorker,
+} from './outbox.js';
 import { clearApplicationRedisData, closeRedis, connectRedis, getRedis } from './redis.js';
 import { verifyPigeonSignature } from './webhook-auth.js';
 
@@ -201,8 +206,8 @@ app.post(
     }
 
     const db = await getDb();
-    const outbound = await db.collection('messages').findOne(
-      { workspace: event.workspace, clientRef, direction: 'outbound' },
+    const outbound = await db.collection('outbox').findOne(
+      { workspace: event.workspace, clientRef },
       { projection: { _id: 1 } },
     );
     if (!outbound) {
@@ -283,6 +288,21 @@ app.get(
         workspace.outbound[message.clientRef] = String(message.status ?? 'queued');
       }
     }
+    const outboundJobs = await db.collection('outbox')
+      .find({ workspace: { $in: workspaceIds } })
+      .toArray();
+    for (const job of outboundJobs) {
+      const workspace = workspaces[job.workspace as string];
+      if (!workspace || typeof job.clientRef !== 'string') continue;
+      const contact = job.contact as string;
+      workspace.contacts[contact] ??= { inbound: [], assignee: null };
+      const deliveryStatus = job.deliveryStatus ?? job.message?.status;
+      if (typeof deliveryStatus === 'string') {
+        workspace.outbound[job.clientRef] = deliveryStatus;
+      } else if (!(job.clientRef in workspace.outbound)) {
+        workspace.outbound[job.clientRef] = job.status === 'failed' ? 'failed' : 'queued';
+      }
+    }
     res.status(200).json({ workspaces });
   }),
 );
@@ -308,50 +328,13 @@ app.post(
       return;
     }
 
-    await ensureConversation(body.workspace, body.contact);
-    const db = await getDb();
-    const now = new Date();
-    const message = {
+    const persisted = await persistOutboundMessage({
       workspace: body.workspace,
       contact: body.contact,
-      direction: 'outbound',
-      clientRef: body.client_ref,
       text: body.text,
-      status: 'queued',
-      statusRank: 0,
-      occurredAt: now,
-      createdAt: now,
-      updatedAt: now,
-    };
-    const outboxJob = {
-      workspace: body.workspace,
-      contact: body.contact,
       clientRef: body.client_ref,
-      text: body.text,
-      attempts: 0,
-      status: 'pending',
-      nextAttemptAt: now,
-      createdAt: now,
-    };
-
-    try {
-      await db.collection('messages').updateOne(
-        { workspace: body.workspace, clientRef: body.client_ref },
-        { $setOnInsert: message },
-        { upsert: true },
-      );
-    } catch (error) {
-      if (!isDuplicateKey(error)) throw error;
-    }
-    try {
-      await db.collection('outbox').updateOne(
-        { workspace: body.workspace, clientRef: body.client_ref },
-        { $setOnInsert: outboxJob },
-        { upsert: true },
-      );
-    } catch (error) {
-      if (!isDuplicateKey(error)) throw error;
-    }
+    });
+    await ensureConversation(body.workspace, persisted.contact);
     res.status(202).json({ status: 'queued', client_ref: body.client_ref });
   }),
 );
