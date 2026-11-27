@@ -1,98 +1,16 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { AuthScreen } from './components/AuthScreen';
+import { ConversationPanel } from './components/ConversationPanel';
+import { InboxSidebar } from './components/InboxSidebar';
+import { ApiError, isSession, requestJson } from './lib/api';
+import type {
+  ConnectionState,
+  Conversation,
+  ConversationDetailResponse,
+  ConversationListResponse,
+  UserSession,
+} from './types';
 import './App.css';
-
-type Membership = { id: string; role: 'admin' | 'agent' };
-type UserSession = { sub: string; workspaces: Membership[] };
-type Conversation = {
-  workspace: string;
-  contact: string;
-  assignee: string | null;
-  status: 'open' | 'closed';
-  lastActivityAt?: string;
-};
-type Message = {
-  workspace: string;
-  contact: string;
-  direction: 'inbound' | 'outbound';
-  text: string;
-  status?: 'received' | 'queued' | 'sent' | 'delivered' | 'failed';
-  occurredAt: string;
-  providerMessageId?: string;
-  clientRef?: string;
-};
-type ConversationListResponse = { conversations: Conversation[] };
-type ConversationDetailResponse = { conversation: Conversation; messages: Message[] };
-
-class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
-    super(message);
-  }
-}
-
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers);
-  if (init?.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
-  const response = await fetch(path, {
-    ...init,
-    headers,
-    credentials: 'same-origin',
-  });
-  const payload: unknown = await response.json().catch(() => null);
-  if (!response.ok) {
-    const message =
-      typeof payload === 'object' &&
-      payload !== null &&
-      'error' in payload &&
-      typeof payload.error === 'string'
-        ? payload.error
-        : `Request failed (${response.status})`;
-    throw new ApiError(message, response.status);
-  }
-  if (payload === null) throw new Error('The server returned an invalid response.');
-  return payload as T;
-}
-
-function isSession(value: unknown): value is UserSession {
-  if (typeof value !== 'object' || value === null || !('sub' in value) || !('workspaces' in value)) {
-    return false;
-  }
-  const candidate = value as { sub: unknown; workspaces: unknown };
-  return typeof candidate.sub === 'string' &&
-    Array.isArray(candidate.workspaces) &&
-    candidate.workspaces.every((membership) =>
-      typeof membership === 'object' &&
-      membership !== null &&
-      'id' in membership &&
-      typeof membership.id === 'string' &&
-      'role' in membership &&
-      (membership.role === 'admin' || membership.role === 'agent'),
-    );
-}
-
-function formatTime(value: string | undefined): string {
-  if (!value) return '';
-  const date = new Date(value);
-  return Number.isNaN(date.getTime())
-    ? ''
-    : new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(date);
-}
-
-function formatDate(value: string): string {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime())
-    ? ''
-    : new Intl.DateTimeFormat(undefined, {
-        month: 'short',
-        day: 'numeric',
-        hour: 'numeric',
-        minute: '2-digit',
-      }).format(date);
-}
-
-function statusLabel(status: Message['status']): string {
-  if (!status || status === 'received') return '';
-  return status;
-}
 
 export function App() {
   const [identity, setIdentity] = useState<UserSession | null>(null);
@@ -102,7 +20,6 @@ export function App() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState('');
-  const [search, setSearch] = useState('');
   const [selectedContact, setSelectedContact] = useState('');
   const [detail, setDetail] = useState<ConversationDetailResponse | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -110,13 +27,11 @@ export function App() {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [actionError, setActionError] = useState('');
-  const [connection, setConnection] = useState<'connecting' | 'connected' | 'reconnecting'>('connecting');
+  const [connection, setConnection] = useState<ConnectionState>('connecting');
   const [refreshVersion, setRefreshVersion] = useState(0);
-  const [filter, setFilter] = useState<'all' | 'open' | 'closed'>('all');
   const lastSequence = useRef(new Map<string, number>());
   const listRequest = useRef(0);
   const detailRequest = useRef(0);
-  const historyElement = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let active = true;
@@ -223,11 +138,6 @@ export function App() {
   }, [workspace, selectedContact, refreshVersion]);
 
   useEffect(() => {
-    const history = historyElement.current;
-    if (history) history.scrollTop = history.scrollHeight;
-  }, [detail]);
-
-  useEffect(() => {
     if (!identity || !workspace) return;
     let active = true;
     let socket: WebSocket | undefined;
@@ -318,8 +228,7 @@ export function App() {
     }
   }
 
-  async function sendReply(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function sendReply() {
     const text = draft.trim();
     if (!text || !workspace || !selectedContact || sending) return;
     setSending(true);
@@ -356,51 +265,17 @@ export function App() {
     );
   }
 
-  const visibleConversations = conversations.filter((conversation) => {
-    const matchesSearch = conversation.contact.toLowerCase().includes(search.toLowerCase());
-    const matchesFilter = filter === 'all' || conversation.status === filter;
-    return matchesSearch && matchesFilter;
-  });
-
-  if (authState === 'loading') {
+  if (authState !== 'ready' || !identity) {
     return (
-      <main className="auth-page">
-        <div className="auth-card"><span className="brand-mark">S</span><p>Checking your session…</p></div>
-      </main>
-    );
-  }
-
-  if (authState === 'error') {
-    return (
-      <main className="auth-page">
-        <section className="auth-card">
-          <span className="brand-mark">S</span>
-          <h1>Switchboard</h1>
-          <p className="muted">We couldn’t connect to your inbox.</p>
-          <p className="error-text">{authError}</p>
-          <button className="button button-primary" onClick={() => window.location.reload()}>Try again</button>
-        </section>
-      </main>
-    );
-  }
-
-  if (authState === 'signedOut' || !identity) {
-    return (
-      <main className="auth-page">
-        <section className="auth-card">
-          <span className="brand-mark">S</span>
-          <h1>Switchboard</h1>
-          <p className="muted">A shared inbox for your support team.</p>
-          {authError && <p className="error-text">{authError}</p>}
-          <a className="button button-primary login-button" href="/auth/login">Sign in</a>
-        </section>
-      </main>
+      <AuthScreen
+        state={authState === 'ready' ? 'signedOut' : authState}
+        error={authError}
+        onRetry={() => window.location.reload()}
+      />
     );
   }
 
   const selectedMembership = identity.workspaces.find((membership) => membership.id === workspace);
-  const currentConversation = detail?.conversation;
-  const assignedToMe = currentConversation?.assignee === identity.sub;
 
   return (
     <main className="app-shell">
@@ -435,179 +310,32 @@ export function App() {
       </header>
 
       <div className="inbox-layout">
-        <aside className="conversation-sidebar">
-          <div className="sidebar-heading">
-            <div>
-              <p className="eyebrow">WORKSPACE INBOX</p>
-              <h1>Conversations</h1>
-            </div>
-            <span className="count-badge">{conversations.length}</span>
-          </div>
-          <div className="inbox-tools">
-            <label className="search-box">
-              <span aria-hidden="true">⌕</span>
-              <input
-                type="search"
-                placeholder="Search contacts"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                aria-label="Search contacts"
-              />
-            </label>
-            <div className="filter-tabs" role="group" aria-label="Conversation status filter">
-              {(['all', 'open', 'closed'] as const).map((value) => (
-                <button
-                  key={value}
-                  className={filter === value ? 'filter-tab active' : 'filter-tab'}
-                  onClick={() => setFilter(value)}
-                >
-                  {value === 'all' ? 'All' : value === 'open' ? 'Open' : 'Closed'}
-                </button>
-              ))}
-            </div>
-          </div>
-          {listError && <div className="inline-error">{listError}</div>}
-          <div className="conversation-list" aria-live="polite">
-            {listLoading && conversations.length === 0 ? (
-              <div className="list-state">Loading conversations…</div>
-            ) : visibleConversations.length === 0 ? (
-              <div className="list-state">
-                <span className="empty-icon">✳</span>
-                <strong>{search || filter !== 'all' ? 'No matches' : 'No conversations yet'}</strong>
-                <span>New customer messages will appear here.</span>
-              </div>
-            ) : (
-              visibleConversations.map((conversation) => (
-                <button
-                  className={selectedContact === conversation.contact ? 'conversation-row selected' : 'conversation-row'}
-                  key={conversation.contact}
-                  onClick={() => {
-                    setSelectedContact(conversation.contact);
-                    setActionError('');
-                  }}
-                >
-                  <span className="contact-avatar">{conversation.contact.slice(-2)}</span>
-                  <span className="conversation-copy">
-                    <span className="conversation-title">
-                      <strong>{conversation.contact}</strong>
-                      <time>{formatTime(conversation.lastActivityAt)}</time>
-                    </span>
-                    <span className="conversation-meta">
-                      <span>{conversation.assignee ? `Assigned · ${conversation.assignee}` : 'Unassigned'}</span>
-                      <span className={`status-dot ${conversation.status}`} />
-                    </span>
-                  </span>
-                </button>
-              ))
-            )}
-          </div>
-          <div className="sidebar-footer">
-            <span className={`connection-dot ${connection}`} />
-            <span>{connection === 'connected' ? 'Live updates on' : connection === 'connecting' ? 'Connecting…' : 'Reconnecting…'}</span>
-          </div>
-        </aside>
-
-        <section className="conversation-panel" aria-label="Selected conversation">
-          {!selectedContact ? (
-            <div className="welcome-state">
-              <span className="welcome-mark">S</span>
-              <h2>Your team inbox</h2>
-              <p>Select a conversation to view its history and reply.</p>
-            </div>
-          ) : detailLoading && !detail ? (
-            <div className="panel-state">Loading conversation…</div>
-          ) : detailError ? (
-            <div className="panel-state">
-              <p className="error-text">{detailError}</p>
-              <button className="button button-secondary" onClick={() => setRefreshVersion((value) => value + 1)}>Retry</button>
-            </div>
-          ) : currentConversation ? (
-            <>
-              <div className="conversation-header">
-                <div className="contact-heading">
-                  <span className="contact-avatar large">{currentConversation.contact.slice(-2)}</span>
-                  <div>
-                    <h2>{currentConversation.contact}</h2>
-                    <p>
-                      {currentConversation.assignee
-                        ? `Assigned to ${currentConversation.assignee}`
-                        : 'No assignee'}
-                      <span className={`status-pill ${currentConversation.status}`}>{currentConversation.status}</span>
-                    </p>
-                  </div>
-                </div>
-                <div className="conversation-actions">
-                  {!currentConversation.assignee ? (
-                    <button className="button button-secondary" onClick={() => void claimConversation()}>
-                      Claim conversation
-                    </button>
-                  ) : assignedToMe ? (
-                    <span className="assigned-label">Assigned to you</span>
-                  ) : (
-                    <span className="assigned-label">Claimed by {currentConversation.assignee}</span>
-                  )}
-                  <button className="button button-quiet" onClick={() => void toggleConversationStatus()}>
-                    {currentConversation.status === 'open' ? 'Close' : 'Reopen'}
-                  </button>
-                </div>
-              </div>
-
-              {actionError && <div className="action-banner" role="alert">{actionError}</div>}
-
-              <div className="message-history" aria-live="polite" ref={historyElement}>
-                {detail?.messages.length ? (
-                  <>
-                    <div className="history-divider"><span>Conversation history</span></div>
-                    {detail.messages.map((message, index) => (
-                      <article
-                        className={`message-row ${message.direction}`}
-                        key={message.providerMessageId ?? message.clientRef ?? `${message.occurredAt}-${index}`}
-                      >
-                        {message.direction === 'inbound' && <span className="message-avatar">C</span>}
-                        <div className="message-content">
-                          <div className="message-meta">
-                            <strong>{message.direction === 'inbound' ? 'Customer' : 'You'}</strong>
-                            <time>{formatDate(message.occurredAt)}</time>
-                          </div>
-                          <div className="message-bubble">{message.text}</div>
-                          {message.direction === 'outbound' && message.status && (
-                            <span className={`delivery-status ${message.status}`}>{statusLabel(message.status)}</span>
-                          )}
-                        </div>
-                      </article>
-                    ))}
-                  </>
-                ) : (
-                  <div className="history-empty">No messages yet. Send the first reply to start the conversation.</div>
-                )}
-              </div>
-
-              <form className="reply-composer" onSubmit={(event) => void sendReply(event)}>
-                <label className="sr-only" htmlFor="reply-text">Write a reply</label>
-                <textarea
-                  id="reply-text"
-                  placeholder={currentConversation.status === 'closed' ? 'Reopen this conversation to reply' : 'Write a reply…'}
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                  disabled={sending || currentConversation.status === 'closed'}
-                  rows={3}
-                />
-                <div className="composer-footer">
-                  <span>Replies are sent to the customer.</span>
-                  <button
-                    className="button button-primary send-button"
-                    type="submit"
-                    disabled={sending || !draft.trim() || currentConversation.status === 'closed'}
-                  >
-                    {sending ? 'Sending…' : 'Send reply'}
-                  </button>
-                </div>
-              </form>
-            </>
-          ) : (
-            <div className="panel-state">Choose a conversation from the inbox.</div>
-          )}
-        </section>
+        <InboxSidebar
+          conversations={conversations}
+          listLoading={listLoading}
+          listError={listError}
+          connection={connection}
+          selectedContact={selectedContact}
+          onSelectContact={(contact) => {
+            setSelectedContact(contact);
+            setActionError('');
+          }}
+        />
+        <ConversationPanel
+          selectedContact={selectedContact}
+          detail={detail}
+          detailLoading={detailLoading}
+          detailError={detailError}
+          identity={identity}
+          draft={draft}
+          onDraftChange={setDraft}
+          sending={sending}
+          actionError={actionError}
+          onClaim={() => void claimConversation()}
+          onToggleStatus={() => void toggleConversationStatus()}
+          onSendReply={() => void sendReply()}
+          onRetry={() => setRefreshVersion((value) => value + 1)}
+        />
       </div>
     </main>
   );
