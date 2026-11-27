@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Db, ObjectId } from 'mongodb';
 import { config } from './config.js';
 import { getDb, getMongoClient, mongoSupportsTransactions } from './db.js';
-import { getRedis } from './redis.js';
+import { appendWorkspaceEvent, publishUnpublishedEvents } from './events.js';
 
 type DeliveryStatus = 'queued' | 'sent' | 'delivered' | 'failed';
 type JobStatus = 'pending' | 'processing' | 'accepted' | 'failed';
@@ -55,19 +55,6 @@ type WorkspaceState = {
   lastEventSeq?: number;
 };
 
-type PersistedStatusEvent = {
-  _id?: ObjectId;
-  workspace: string;
-  seq: number;
-  eventKey: string;
-  type: 'message.status';
-  contact: string;
-  client_ref: string;
-  status: Exclude<DeliveryStatus, 'queued'>;
-  createdAt: Date;
-  publishedAt?: Date;
-};
-
 type NewOutboundMessage = {
   workspace: string;
   contact: string;
@@ -79,7 +66,9 @@ const leaseMs = 20_000;
 const workspaceSendIntervalMs = 250;
 let stopped = true;
 let timer: ReturnType<typeof setTimeout> | undefined;
+let eventTimer: ReturnType<typeof setTimeout> | undefined;
 let active: Promise<void> | undefined;
+let activeEvents: Promise<void> | undefined;
 
 function isDuplicateKey(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 11000;
@@ -353,61 +342,16 @@ async function publishPendingStatusEvents(db: Db): Promise<void> {
     .sort({ createdAt: 1 })
     .limit(50)
     .toArray();
-  const eventCollection = db.collection<PersistedStatusEvent>('events_websocket');
-  const redis = getRedis();
-
   for (const job of jobs) {
     for (const event of job.pendingStatusEvents ?? []) {
-      let persisted = await eventCollection.findOne(
-        { workspace: job.workspace, eventKey: event.eventKey },
-      );
-      if (!persisted) {
-        const workspace = await db.collection<WorkspaceState>('workspaces').findOneAndUpdate(
-          { _id: job.workspace },
-          { $inc: { lastEventSeq: 1 } },
-          { returnDocument: 'after' },
-        );
-        if (!workspace) throw new Error(`Workspace ${job.workspace} missing while assigning event sequence`);
-        const seq = Number(workspace.lastEventSeq);
-        if (!Number.isSafeInteger(seq) || seq < 1) throw new Error('Invalid workspace event sequence');
-        const eventDocument = {
-          workspace: job.workspace,
-          seq,
-          eventKey: event.eventKey,
-          type: event.type,
-          contact: event.contact,
-          client_ref: event.client_ref,
-          status: event.status,
-          createdAt: event.createdAt,
-        };
-        try {
-          await eventCollection.insertOne(eventDocument);
-          persisted = await eventCollection.findOne({ workspace: job.workspace, eventKey: event.eventKey });
-          if (!persisted) throw new Error('Persistent status event is missing after insertion');
-        } catch (error) {
-          if (!isDuplicateKey(error)) throw error;
-          persisted = await eventCollection.findOne({ workspace: job.workspace, eventKey: event.eventKey });
-          if (!persisted) throw error;
-        }
-      }
-
-      if (!persisted) throw new Error('Persistent status event is missing');
-      if (!persisted.publishedAt) {
-        await redis.publish(
-          `switchboard:events:${job.workspace}`,
-          JSON.stringify({
-            seq: persisted.seq,
-            type: persisted.type,
-            contact: persisted.contact,
-            client_ref: persisted.client_ref,
-            status: persisted.status,
-          }),
-        );
-        await eventCollection.updateOne(
-          { _id: persisted._id },
-          { $set: { publishedAt: new Date() } },
-        );
-      }
+      await appendWorkspaceEvent(db, {
+        workspace: job.workspace,
+        eventKey: event.eventKey,
+        type: event.type,
+        contact: event.contact,
+        client_ref: event.client_ref,
+        status: event.status,
+      });
       await db.collection<OutboxJob>('outbox').updateOne(
         { _id: job._id, 'pendingStatusEvents.eventKey': event.eventKey },
         { $pull: { pendingStatusEvents: { eventKey: event.eventKey } } },
@@ -530,16 +474,32 @@ async function tick(): Promise<void> {
   if (stopped) return;
   active = (async () => {
     const db = await getDb();
-    await publishPendingStatusEvents(db);
     await processOne(db);
-  })();
+  })().catch((error: unknown) => {
+    console.error('[outbox] job processing failed', error instanceof Error ? error.message : 'unknown error');
+  });
   try {
     await active;
-  } catch (error) {
-    console.error('[outbox] worker iteration failed', error instanceof Error ? error.message : 'unknown error');
   } finally {
     active = undefined;
     if (!stopped) timer = setTimeout(() => void tick(), 100);
+  }
+}
+
+async function eventTick(): Promise<void> {
+  if (stopped) return;
+  activeEvents = (async () => {
+    const db = await getDb();
+    await publishPendingStatusEvents(db);
+    await publishUnpublishedEvents(db);
+  })().catch((error: unknown) => {
+    console.error('[events] publisher iteration failed', error instanceof Error ? error.message : 'unknown error');
+  });
+  try {
+    await activeEvents;
+  } finally {
+    activeEvents = undefined;
+    if (!stopped) eventTimer = setTimeout(() => void eventTick(), 100);
   }
 }
 
@@ -547,13 +507,16 @@ export function startOutboxWorker(): void {
   if (!stopped) return;
   stopped = false;
   void tick();
+  void eventTick();
 }
 
 export async function stopOutboxWorker(): Promise<void> {
   stopped = true;
   if (timer) clearTimeout(timer);
+  if (eventTimer) clearTimeout(eventTimer);
   timer = undefined;
-  await active;
+  eventTimer = undefined;
+  await Promise.all([active, activeEvents].filter((run): run is Promise<void> => Boolean(run)));
 }
 
 export async function applyOutboundStatus(

@@ -3,6 +3,9 @@ import { timingSafeEqual } from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { closeDb, connectDb, getDb } from './db.js';
 import { config } from './config.js';
+import { authRouter } from './auth.js';
+import { appendWorkspaceEvent } from './events.js';
+import { asyncRoute } from './http-utils.js';
 import {
   applyOutboundStatus,
   persistOutboundMessage,
@@ -10,6 +13,7 @@ import {
   stopOutboxWorker,
 } from './outbox.js';
 import { clearApplicationRedisData, closeRedis, connectRedis, getRedis } from './redis.js';
+import { closeRealtime, initializeRealtime } from './realtime.js';
 import { verifyPigeonSignature } from './webhook-auth.js';
 
 type JsonRecord = Record<string, unknown>;
@@ -33,14 +37,6 @@ function isSafeHeaderValue(value: unknown, maxLength = 1000): value is string {
 
 function isDuplicateKey(error: unknown): boolean {
   return isRecord(error) && error.code === 11000;
-}
-
-function asyncRoute(
-  handler: (req: Request, res: Response, next: NextFunction) => Promise<void>,
-) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    void handler(req, res, next).catch(next);
-  };
 }
 
 async function workspaceExists(workspace: string): Promise<boolean> {
@@ -191,6 +187,13 @@ app.post(
       } catch (error) {
         if (!isDuplicateKey(error)) throw error;
       }
+      await appendWorkspaceEvent(db, {
+        workspace: event.workspace,
+        eventKey: JSON.stringify(['message.inbound', messageId]),
+        type: 'message.inbound',
+        contact: from,
+        message_id: messageId,
+      });
       res.status(200).json({ ok: true });
       return;
     }
@@ -221,6 +224,7 @@ app.post(
 );
 
 app.use(express.json({ limit: '1mb' }));
+app.use(authRouter);
 app.use('/__grader', graderAuth);
 
 app.post(
@@ -359,15 +363,33 @@ app.post(
 
     await ensureConversation(body.workspace, body.contact);
     const db = await getDb();
-    const result = await db.collection('conversations').updateOne(
+    const conversations = db.collection('conversations');
+    const assigned = await conversations.findOneAndUpdate(
       {
         workspace: body.workspace,
         contact: body.contact,
-        $or: [{ assignee: null }, { assignee: { $exists: false } }, { assignee: body.agent }],
+        $or: [{ assignee: null }, { assignee: { $exists: false } }],
       },
-      { $set: { assignee: body.agent, updatedAt: new Date() } },
+      {
+        $set: { assignee: body.agent, updatedAt: new Date() },
+        $inc: { assignmentVersion: 1 },
+      },
+      { returnDocument: 'after' },
     );
-    if (result.matchedCount > 0) {
+    const current = assigned ?? await conversations.findOne({
+      workspace: body.workspace,
+      contact: body.contact,
+      assignee: body.agent,
+    });
+    if (current) {
+      const assignmentVersion = Number(current.assignmentVersion ?? 0);
+      await appendWorkspaceEvent(db, {
+        workspace: body.workspace,
+        eventKey: JSON.stringify(['conversation.assigned', body.contact, assignmentVersion]),
+        type: 'conversation.assigned',
+        contact: body.contact,
+        assignee: body.agent,
+      });
       res.status(200).json({ assignee: body.agent });
       return;
     }
@@ -387,6 +409,7 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 async function start(): Promise<void> {
   await connectDb();
   await connectRedis();
+  await initializeRealtime(server);
   startOutboxWorker();
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -405,6 +428,7 @@ async function shutdown(signal: string): Promise<void> {
   ready = false;
   console.log(`received ${signal}; shutting down`);
   await stopOutboxWorker();
+  await closeRealtime();
   await new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
@@ -422,6 +446,6 @@ process.on('SIGTERM', () => void shutdown('SIGTERM').catch((error: unknown) => {
 
 void start().catch(async (error: unknown) => {
   console.error('startup failed', error instanceof Error ? error.message : 'unknown error');
-  await Promise.allSettled([closeDb(), closeRedis()]);
+  await Promise.allSettled([closeRealtime(), closeDb(), closeRedis()]);
   process.exitCode = 1;
 });
