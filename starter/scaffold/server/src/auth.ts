@@ -1,7 +1,6 @@
 import { createHash, createPublicKey, randomBytes, verify } from 'node:crypto';
-import { Router, type Request } from 'express';
+import { Router } from 'express';
 import { config } from './config.js';
-import { getDb } from './db.js';
 import { asyncRoute } from './http-utils.js';
 import { getRedis } from './redis.js';
 
@@ -331,30 +330,6 @@ function loginRouter(): ReturnType<typeof Router> {
     }
     res.setHeader('Cache-Control', 'no-store');
     res.status(200).json(session);
-  }));
-
-  router.get('/api/conversations', asyncRoute(async (req: Request, res) => {
-    const session = await sessionFromCookie(req.headers.cookie);
-    if (!session) {
-      res.status(401).json({ error: 'unauthorized' });
-      return;
-    }
-    const workspace = typeof req.query.workspace === 'string' ? req.query.workspace : '';
-    if (!isNonEmptyString(workspace, 100)) {
-      res.status(400).json({ error: 'workspace_required' });
-      return;
-    }
-    if (!session.workspaces.some((membership) => membership.id === workspace)) {
-      res.status(403).json({ error: 'forbidden' });
-      return;
-    }
-    const db = await getDb();
-    const conversations = await db.collection('conversations')
-      .find({ workspace })
-      .sort({ lastActivityAt: -1, contact: 1 })
-      .limit(100)
-      .toArray();
-    res.status(200).json({ conversations });
   }));
 
   return router;

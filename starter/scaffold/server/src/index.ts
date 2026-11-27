@@ -4,7 +4,9 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { closeDb, connectDb, getDb } from './db.js';
 import { config } from './config.js';
 import { authRouter } from './auth.js';
+import { inboxRouter } from './inbox-api.js';
 import { appendWorkspaceEvent } from './events.js';
+import { claimConversation, ensureConversation, workspaceExists } from './conversation-service.js';
 import { asyncRoute } from './http-utils.js';
 import {
   applyOutboundStatus,
@@ -37,40 +39,6 @@ function isSafeHeaderValue(value: unknown, maxLength = 1000): value is string {
 
 function isDuplicateKey(error: unknown): boolean {
   return isRecord(error) && error.code === 11000;
-}
-
-async function workspaceExists(workspace: string): Promise<boolean> {
-  const db = await getDb();
-  return Boolean(
-    await db.collection<WorkspaceDocument>('workspaces').findOne({ _id: workspace }, { projection: { _id: 1 } }),
-  );
-}
-
-async function ensureConversation(
-  workspace: string,
-  contact: string,
-  activityAt = new Date(),
-): Promise<void> {
-  const db = await getDb();
-  try {
-    await db.collection('conversations').updateOne(
-      { workspace, contact },
-      {
-        $setOnInsert: {
-          workspace,
-          contact,
-          assignee: null,
-          status: 'open',
-          createdAt: activityAt,
-        },
-        $set: { updatedAt: new Date() },
-        $max: { lastActivityAt: activityAt },
-      },
-      { upsert: true },
-    );
-  } catch (error) {
-    if (!isDuplicateKey(error)) throw error;
-  }
 }
 
 async function recordProviderEvent(
@@ -225,6 +193,7 @@ app.post(
 
 app.use(express.json({ limit: '1mb' }));
 app.use(authRouter);
+app.use(inboxRouter);
 app.use('/__grader', graderAuth);
 
 app.post(
@@ -361,35 +330,8 @@ app.post(
       return;
     }
 
-    await ensureConversation(body.workspace, body.contact);
-    const db = await getDb();
-    const conversations = db.collection('conversations');
-    const assigned = await conversations.findOneAndUpdate(
-      {
-        workspace: body.workspace,
-        contact: body.contact,
-        $or: [{ assignee: null }, { assignee: { $exists: false } }],
-      },
-      {
-        $set: { assignee: body.agent, updatedAt: new Date() },
-        $inc: { assignmentVersion: 1 },
-      },
-      { returnDocument: 'after' },
-    );
-    const current = assigned ?? await conversations.findOne({
-      workspace: body.workspace,
-      contact: body.contact,
-      assignee: body.agent,
-    });
-    if (current) {
-      const assignmentVersion = Number(current.assignmentVersion ?? 0);
-      await appendWorkspaceEvent(db, {
-        workspace: body.workspace,
-        eventKey: JSON.stringify(['conversation.assigned', body.contact, assignmentVersion]),
-        type: 'conversation.assigned',
-        contact: body.contact,
-        assignee: body.agent,
-      });
+    const claimed = await claimConversation(body.workspace, body.contact, body.agent);
+    if (claimed) {
       res.status(200).json({ assignee: body.agent });
       return;
     }

@@ -91,6 +91,7 @@ function eventFrame(event: WorkspaceEventDocument): Record<string, unknown> {
     ...(event.client_ref ? { client_ref: event.client_ref } : {}),
     ...(event.status ? { status: event.status } : {}),
     ...(event.assignee ? { assignee: event.assignee } : {}),
+    ...(event.conversation_status ? { status: event.conversation_status } : {}),
   };
 }
 

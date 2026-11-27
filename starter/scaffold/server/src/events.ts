@@ -6,12 +6,13 @@ import { getRedis } from './redis.js';
 export type WorkspaceEventInput = {
   workspace: string;
   eventKey: string;
-  type: 'message.inbound' | 'message.status' | 'conversation.assigned';
+  type: 'message.inbound' | 'message.status' | 'conversation.assigned' | 'conversation.status';
   contact: string;
   message_id?: string;
   client_ref?: string;
   status?: 'sent' | 'delivered' | 'failed';
   assignee?: string;
+  conversation_status?: 'open' | 'closed';
 };
 
 export type WorkspaceEventDocument = WorkspaceEventInput & {
@@ -190,7 +191,17 @@ export async function publishUnpublishedEvents(database?: Db): Promise<void> {
   const redis = getRedis();
 
   for (const event of events) {
-    const { workspace, seq, type, contact, message_id, client_ref, status, assignee } = event;
+    const {
+      workspace,
+      seq,
+      type,
+      contact,
+      message_id,
+      client_ref,
+      status,
+      assignee,
+      conversation_status,
+    } = event;
     const frame = {
       seq,
       type,
@@ -199,6 +210,7 @@ export async function publishUnpublishedEvents(database?: Db): Promise<void> {
       ...(client_ref ? { client_ref } : {}),
       ...(status ? { status } : {}),
       ...(assignee ? { assignee } : {}),
+      ...(conversation_status ? { status: conversation_status } : {}),
     };
     await redis.publish(`switchboard:events:${workspace}`, JSON.stringify(frame));
     await db.collection<WorkspaceEventDocument>('events_websocket').updateOne(
