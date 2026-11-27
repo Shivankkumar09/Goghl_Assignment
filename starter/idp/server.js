@@ -27,6 +27,13 @@ const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLen
 const KID = crypto.randomBytes(6).toString('hex');
 const jwk = Object.assign(publicKey.export({ format: 'jwk' }), { kid: KID, use: 'sig', alg: 'RS256' });
 const b64 = (x) => Buffer.from(typeof x === 'string' ? x : JSON.stringify(x)).toString('base64url');
+const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;',
+})[character]);
 
 function signJwt(claims) {
   const head = b64({ alg: 'RS256', typ: 'JWT', kid: KID });
@@ -98,14 +105,301 @@ http
         res.writeHead(302, { location: back.toString() });
         return res.end();
       }
-      const links = USERS.map((u) => {
+      const accounts = USERS.map((u) => {
         const next = new URL(url);
         next.searchParams.set('login', u.sub);
-        const roles = u.workspaces.map((w) => w.id + ' (' + w.role + ')').join(', ');
-        return '<li><a href="' + next.pathname + next.search.replace(/"/g, '&quot;') + '">' + u.name + '</a> <small>' + u.email + ' · ' + roles + '</small></li>';
+        const initials = u.name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase();
+        const workspaces = u.workspaces.map((w) =>
+          '<span class="workspace-tag">' +
+            '<span class="workspace-name">' + escapeHtml(w.id) + '</span>' +
+            '<span class="workspace-role">' + escapeHtml(w.role) + '</span>' +
+          '</span>',
+        ).join('');
+        return (
+          '<li>' +
+            '<a class="account-card" href="' + escapeHtml(next.pathname + next.search) + '" aria-label="Continue as ' + escapeHtml(u.name) + '">' +
+              '<span class="avatar" aria-hidden="true">' + escapeHtml(initials) + '</span>' +
+              '<span class="account-details">' +
+                '<span class="account-heading">' +
+                  '<strong>' + escapeHtml(u.name) + '</strong>' +
+                  '<span class="account-arrow" aria-hidden="true">→</span>' +
+                '</span>' +
+                '<span class="account-email">' + escapeHtml(u.email) + '</span>' +
+                '<span class="workspace-list">' + workspaces + '</span>' +
+              '</span>' +
+            '</a>' +
+          '</li>'
+        );
       }).join('');
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      return res.end('<!doctype html><meta charset="utf-8"><title>Mock IdP</title><body style="font:16px system-ui;max-width:560px;margin:60px auto"><h2>Mock identity provider</h2><p>Sign in as:</p><ul style="line-height:2">' + links + '</ul></body>');
+      return res.end(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Choose an account · Switchboard</title>
+    <style>
+      :root {
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #233531;
+        background: #f3f7f5;
+        font-synthesis: none;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        min-width: 320px;
+        min-height: 100vh;
+        margin: 0;
+        background:
+          radial-gradient(ellipse at 50% 12%, rgba(196, 230, 216, 0.62), transparent 42%),
+          #f3f7f5;
+      }
+
+      .page-shell {
+        display: flex;
+        width: min(100% - 40px, 940px);
+        min-height: 100vh;
+        flex-direction: column;
+        margin: 0 auto;
+      }
+
+      .site-header {
+        display: flex;
+        min-height: 88px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 11px;
+        color: inherit;
+        text-decoration: none;
+      }
+
+      .brand-mark {
+        display: grid;
+        width: 40px;
+        height: 40px;
+        place-items: center;
+        border-radius: 12px;
+        background: #147d66;
+        color: #fff;
+        font-size: 15px;
+        font-weight: 800;
+        letter-spacing: -0.5px;
+      }
+
+      .brand-copy { display: grid; gap: 2px; }
+      .brand-copy strong { font-size: 14px; letter-spacing: -0.2px; }
+      .brand-copy span { color: #7d8c87; font-size: 11px; }
+
+      .environment {
+        padding: 7px 10px;
+        border: 1px solid #dfe9e4;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.58);
+        color: #687a73;
+        font-size: 11px;
+        font-weight: 650;
+      }
+
+      main {
+        display: grid;
+        flex: 1;
+        place-items: center;
+        padding: 24px 0 42px;
+      }
+
+      .auth-card {
+        width: min(100%, 590px);
+        padding: 38px;
+        border: 1px solid #e4ece8;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 22px 65px rgba(35, 67, 55, 0.09);
+      }
+
+      .eyebrow {
+        margin: 0 0 9px;
+        color: #31816b;
+        font-size: 10px;
+        font-weight: 760;
+        letter-spacing: 1.25px;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        color: #233531;
+        font-size: clamp(24px, 4vw, 30px);
+        letter-spacing: -1px;
+        line-height: 1.15;
+      }
+
+      .intro {
+        max-width: 440px;
+        margin: 11px 0 26px;
+        color: #71817b;
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .account-list {
+        display: grid;
+        gap: 10px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .account-card {
+        display: grid;
+        grid-template-columns: 42px minmax(0, 1fr);
+        align-items: center;
+        gap: 13px;
+        padding: 14px;
+        border: 1px solid #e6ece9;
+        border-radius: 12px;
+        background: #fff;
+        color: inherit;
+        text-decoration: none;
+        transition: border-color 140ms ease, background-color 140ms ease, transform 140ms ease;
+      }
+
+      .account-card:hover {
+        transform: translateY(-1px);
+        border-color: #b7d8ca;
+        background: #fbfdfc;
+      }
+
+      .account-card:focus-visible {
+        outline: 3px solid rgba(32, 132, 105, 0.28);
+        outline-offset: 2px;
+      }
+
+      .avatar {
+        display: grid;
+        width: 42px;
+        height: 42px;
+        place-items: center;
+        border-radius: 50%;
+        background: #e7f3ee;
+        color: #28725e;
+        font-size: 12px;
+        font-weight: 750;
+      }
+
+      .account-details { display: grid; min-width: 0; gap: 5px; }
+      .account-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      .account-heading strong { overflow: hidden; font-size: 13px; font-weight: 720; text-overflow: ellipsis; }
+      .account-arrow { color: #7e9c90; font-size: 17px; line-height: 1; }
+      .account-email { color: #81908a; font-size: 11px; }
+      .workspace-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 2px; }
+
+      .workspace-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 4px 7px;
+        border-radius: 5px;
+        background: #f1f6f3;
+        color: #5e7268;
+        font-size: 9px;
+      }
+
+      .workspace-name { font-weight: 680; }
+      .workspace-role { color: #84938d; }
+
+      .card-note {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 19px 0 0;
+        padding-top: 16px;
+        border-top: 1px solid #edf1ef;
+        color: #87958f;
+        font-size: 10px;
+        line-height: 1.5;
+      }
+
+      .note-icon {
+        display: grid;
+        width: 17px;
+        height: 17px;
+        flex: 0 0 auto;
+        place-items: center;
+        border-radius: 50%;
+        background: #eef5f1;
+        color: #648274;
+        font-size: 11px;
+        font-weight: 750;
+      }
+
+      footer {
+        display: flex;
+        min-height: 56px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        color: #93a099;
+        font-size: 10px;
+      }
+
+      @media (max-width: 560px) {
+        .page-shell { width: min(100% - 28px, 460px); }
+        .site-header { min-height: 72px; }
+        .environment { padding: 6px 8px; font-size: 9px; }
+        .auth-card { padding: 25px 18px; border-radius: 15px; }
+        .intro { font-size: 12px; }
+        .account-card { grid-template-columns: 37px minmax(0, 1fr); gap: 10px; padding: 12px; }
+        .avatar { width: 37px; height: 37px; }
+        footer { align-items: flex-start; flex-direction: column; justify-content: center; padding: 12px 0; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="site-header">
+        <div class="brand" aria-label="Switchboard identity provider">
+          <span class="brand-mark" aria-hidden="true">S</span>
+          <span class="brand-copy">
+            <strong>switchboard</strong>
+            <span>Identity provider</span>
+          </span>
+        </div>
+        <span class="environment">Local development</span>
+      </header>
+      <main>
+        <section class="auth-card" aria-labelledby="page-title">
+          <p class="eyebrow">Account selection</p>
+          <h1 id="page-title">Choose a test user</h1>
+          <p class="intro">Select an identity to continue to Switchboard. Workspace access for each account is shown below.</p>
+          <ul class="account-list" aria-label="Available test accounts">${accounts}</ul>
+          <p class="card-note">
+            <span class="note-icon" aria-hidden="true">i</span>
+            <span>This mock identity provider is for local development. No password is required.</span>
+          </p>
+        </section>
+      </main>
+      <footer>
+        <span>Switchboard assessment environment</span>
+        <span>Mock OpenID Connect provider</span>
+      </footer>
+    </div>
+  </body>
+</html>`);
     }
 
     if (url.pathname === '/token' && req.method === 'POST') {
